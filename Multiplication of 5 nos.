@@ -1,0 +1,111 @@
+import os
+import pickle
+import time
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader
+import pinecone
+
+# Configuration
+PINECONE_API_KEY = os.getenv("pcsk_67zmpR_Sqtbquj3UHPoRgYhgevUPDgqf3a9xWA6GXZwNB7g5HzieJ57VJY2xN1JVrnkQhg")
+PINECONE_ENVIRONMENT = os.getenv("us-east-1")
+EMBEDDING_FILE = "embeddings.pkl"
+UPLOAD_DIR = "./uploaded_files"
+ALLOWED_FORMAT = ".pdf"
+
+# Initialize FastAPI
+app = FastAPI()
+
+# Initialize Pinecone
+pinecone.init(api_key=pcsk_67zmpR_Sqtbquj3UHPoRgYhgevUPDgqf3a9xWA6GXZwNB7g5HzieJ57VJY2xN1JVrnkQhg, environment=us-east-1)
+index_name = "semantic-chunks"
+if index_name not in pinecone.list_indexes():
+    pinecone.create_index(index_name, dimension=384)
+index = pinecone.Index(index_name)
+
+def load_pdf(file):
+    """Load the PDF file."""
+    try:
+        with open("temp_pdf_file.pdf", "wb") as f:
+            f.write(file.file.read())
+        docs = PyPDFLoader("temp_pdf_file.pdf").load()
+        return docs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error loading PDF: {str(e)}")
+
+def split_document(docs):
+    """Split the document into chunks."""
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = text_splitter.split_documents(docs)
+    return splits
+
+def create_embeddings(splits):
+    """Create and save embeddings."""
+    model_name = "BAAI/bge-small-en"
+    model_kwargs = {"device": "cpu"}
+    encode_kwargs = {"normalize_embeddings": True}
+    
+    hf_embeddings = HuggingFaceBgeEmbeddings(
+        model_name=model_name, model_kwargs=model_kwargs, encode_kwargs=encode_kwargs
+    )
+
+    embedded_docs = []
+    for split in splits:
+        embedded_docs.append(split)
+
+    # Create FAISS vectorstore
+    vectorstore = FAISS.from_documents(embedded_docs, hf_embeddings)
+
+    # Save embeddings locally
+    with open(EMBEDDING_FILE, "wb") as f:
+        pickle.dump(vectorstore, f)
+
+    # Store embeddings in Pinecone
+    for i, doc in enumerate(embedded_docs):
+        index.upsert(vectors=[(f"chunk-{i}", hf_embeddings.embed_query(doc.page_content))])
+
+    return vectorstore
+
+@app.post("/upload-pdf/")
+async def upload_pdf(file: UploadFile = File(...)):
+    """Endpoint to upload and process PDF files."""
+    if not file.filename.endswith(ALLOWED_FORMAT):
+        raise HTTPException(status_code=400, detail="Invalid file format. Only PDF files are allowed.")
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    file_location = os.path.join(UPLOAD_DIR, file.filename)
+
+    with open(file_location, "wb") as f:
+        f.write(file.file.read())
+
+    # Process the PDF
+    docs = load_pdf(file)
+    splits = split_document(docs)
+    vectorstore = create_embeddings(splits)
+
+    return {"message": "File processed successfully", "chunks": len(splits)}
+
+@app.post("/process-numbers/")
+async def process_numbers(numbers: list[int]):
+    """Check if the multiplication of 5 numbers is prime."""
+    if len(numbers) != 5:
+        raise HTTPException(status_code=400, detail="Exactly 5 numbers are required.")
+
+    product = 1
+    for num in numbers:
+        product *= num
+
+    if product < 2:
+        return {"result": False, "reason": "Product is less than 2, not a prime number."}
+
+    for i in range(2, int(product ** 0.5) + 1):
+        if product % i == 0:
+            return {"result": False, "reason": f"Divisible by {i}."}
+
+    return {"result": True, "reason": "Product is a prime number."}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
